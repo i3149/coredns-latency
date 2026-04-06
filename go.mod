@@ -1,4 +1,4 @@
-module github.com/yourorg/coredns-latency
+module github.com/i3149/coredns-latency
 
 go 1.25
 
