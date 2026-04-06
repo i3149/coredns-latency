@@ -1,0 +1,42 @@
+##############################################################################
+# Corefile examples for the "latency" plugin
+##############################################################################
+
+# ── Example 1: Basic (sorted-set, all zones) ─────────────────────────────────
+. {
+    latency {
+        redis_addr  localhost:6379
+        key_format  sorted_set
+        ttl         5
+        fallback          # pass through if no Redis data
+    }
+    forward . 8.8.8.8    # forward everything else upstream
+    log
+}
+
+# ── Example 2: Zone-scoped with hash format ───────────────────────────────────
+example.com {
+    latency example.com {
+        redis_addr     redis.internal:6379
+        redis_password s3cr3t
+        redis_db       1
+        redis_timeout  200ms
+        key_format     hash
+        key_prefix     dns:latency:
+        ttl            10
+    }
+    forward . 1.1.1.1
+    log
+    errors
+    prometheus :9153
+}
+
+# ── Example 3: IPv6 back-end IPs (sorted set) ────────────────────────────────
+ipv6.example.com {
+    latency ipv6.example.com {
+        redis_addr  localhost:6379
+        key_format  sorted_set
+        ttl         30
+    }
+    log
+}
