@@ -1,0 +1,40 @@
+services:
+  redis:
+    image: redis:latest
+    tmpfs:
+        - /data
+    environment:
+        - REDIS_ARGS=--requirepass pass --appendonly yes
+    restart: unless-stopped
+  ktranslate_flow:
+    image: kentik/ktranslate:next
+    restart: always
+    depends_on:
+      - redis
+    environment:
+        - KENTIK_API_TOKEN=f6afa078d50198a9831cf0ed4b88d9df
+    command:
+      - --listen=0.0.0.0:9995
+      - --metalisten=0.0.0.0:9996
+      - --redis.password=pass
+      - --redis.addr=redis:6379
+      - --redis.db=0
+      - --format=redis
+      - --log_level=debug
+      - --kentik_email=kproxy-agent+15065@kentik.com
+      - --redis.key_prefix=latency_
+    ports:
+      - 4040:9995
+      - 14005:9996
+  coredns:
+    image: coredns/coredns:latest
+    command: ["-conf", "/etc/coredns/Corefile.lat"]
+    ports:
+      - "5353:5353/udp"
+      - "5353:5353/tcp"
+    volumes:
+      - ./conf:/etc/coredns
+      - ./coredns:/coredns
+    restart: unless-stopped
+    depends_on:
+      - redis
