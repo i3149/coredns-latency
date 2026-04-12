@@ -16,45 +16,32 @@ import (
 
 var log = clog.NewWithPlugin("latency")
 
+/**
+TODO
+*/
+
 // RedisKeyFormat defines how latency keys are stored in Redis.
 //
-// Two layouts are supported (configured via `key_format`):
-//
-//  1. sorted_set (default)
-//     Key  : "latency:<fqdn>"          e.g. "latency:api.example.com."
+//  1. sorted_set
+//     Key  : "latency:<fqdn>:<dns_type>"          e.g. "latency:api.example.com.:A"
 //     Type : Redis Sorted Set
 //     Score: latency in milliseconds (float64)
 //     Member: IP address string        e.g. "10.0.0.1"
 //
-//     ZADD latency:api.example.com. 12.5 10.0.0.1
-//     ZADD latency:api.example.com.  8.3 10.0.0.2
-//
-//  2. hash
-//     Key  : "latency:<fqdn>"
-//     Type : Redis Hash
-//     Field: IP address string
-//     Value: latency in milliseconds (string-encoded float) e.g. "12.5"
-//
-//     HSET latency:api.example.com. 10.0.0.1 12.5
-//     HSET latency:api.example.com. 10.0.0.2  8.3
-
-type keyFormat int
-
-const (
-	sortedSet keyFormat = iota
-	hashMap
-)
+//     ZADD latency:api.example.com.:A  12.5 10.0.0.1
+//     ZADD latency:api.example.com.:A  8.3 10.0.0.2
 
 // LatencyPlugin is the main plugin struct.
 type LatencyPlugin struct {
 	Next plugin.Handler
 
-	rdb       *redis.Client
-	keyPrefix string    // default: "latency:"
-	format    keyFormat // sortedSet | hashMap
-	ttl       uint32    // TTL for synthesised A/AAAA records (seconds)
-	fallback  bool      // pass through to next plugin when no Redis data found
-	zones     []string  // zones this plugin is authoritative for; empty = all
+	rdb            *redis.Client
+	keyPrefix      string   // default: "latency:"
+	ttl            uint32   // TTL for synthesised A/AAAA records (seconds)
+	fallback       bool     // pass through to next plugin when no Redis data found
+	zones          []string // zones this plugin is authoritative for; empty = all
+	maxIPS         int64    // Max number of IPs to return for a given service.
+	maxLatencyDiff float64  // Max difference between lowest and highest latencies in an equivalence class.
 }
 
 // Name implements plugin.Handler.
@@ -81,8 +68,8 @@ func (lp *LatencyPlugin) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *
 
 	start := time.Now()
 
-	ip, err := lp.lowestLatencyIP(ctx, qname)
-	if err != nil || ip == nil {
+	ips, err := lp.lowestLatencyIPS(ctx, qname, qtype)
+	if err != nil || len(ips) == 0 {
 		if lp.fallback {
 			log.Debugf("no latency data for %s, falling through", qname)
 			return plugin.NextOrFailure(lp.Name(), lp.Next, ctx, w, r)
@@ -92,36 +79,35 @@ func (lp *LatencyPlugin) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *
 	}
 
 	elapsed := time.Since(start)
-	log.Debugf("resolved %s → %s (redis lookup: %s)", qname, ip, elapsed)
+	log.Debugf("resolved %s → %v (redis lookup: %s)", qname, ips, elapsed)
 
 	// Record metrics.
 	requestCount.WithLabelValues(metrics.WithServer(ctx)).Inc()
 	redisLookupDuration.WithLabelValues(metrics.WithServer(ctx)).Observe(elapsed.Seconds())
 
-	msg := buildResponse(r, qname, ip, lp.ttl, qtype)
+	msg := buildResponse(r, qname, ips, lp.ttl, qtype)
 	if err := w.WriteMsg(msg); err != nil {
 		return dns.RcodeServerFailure, err
 	}
 	return dns.RcodeSuccess, nil
 }
 
-// lowestLatencyIP queries Redis for the IP with the smallest latency score.
-func (lp *LatencyPlugin) lowestLatencyIP(ctx context.Context, fqdn string) (net.IP, error) {
+// lowestLatencyIP queries Redis for the IP set with the smallest latency score.
+func (lp *LatencyPlugin) lowestLatencyIPS(ctx context.Context, fqdn string, qtype uint16) ([]net.IP, error) {
 	key := lp.keyPrefix + fqdn
-
-	switch lp.format {
-	case sortedSet:
-		return lp.fromSortedSet(ctx, key)
-	case hashMap:
-		return lp.fromHash(ctx, key)
-	default:
-		return nil, fmt.Errorf("unknown key format %d", lp.format)
+	switch qtype {
+	case dns.TypeA:
+		key = key + ":A"
+	case dns.TypeAAAA:
+		key = key + ":AAAA"
 	}
+
+	return lp.fromSortedSet(ctx, key)
 }
 
 // fromSortedSet uses ZRANGE key 0 0 (lowest score first).
-func (lp *LatencyPlugin) fromSortedSet(ctx context.Context, key string) (net.IP, error) {
-	results, err := lp.rdb.ZRangeWithScores(ctx, key, 0, 0).Result()
+func (lp *LatencyPlugin) fromSortedSet(ctx context.Context, key string) ([]net.IP, error) {
+	results, err := lp.rdb.ZRangeWithScores(ctx, key, 0, lp.maxIPS).Result()
 	if err != nil {
 		return nil, fmt.Errorf("ZRANGE %s: %w", key, err)
 	}
@@ -129,51 +115,33 @@ func (lp *LatencyPlugin) fromSortedSet(ctx context.Context, key string) (net.IP,
 		return nil, fmt.Errorf("sorted set %q is empty or does not exist", key)
 	}
 
-	ipStr, ok := results[0].Member.(string)
-	if !ok {
-		return nil, fmt.Errorf("unexpected member type in sorted set %q", key)
-	}
-
-	log.Debugf("sorted_set: key=%s best_ip=%s latency=%.2fms", key, ipStr, results[0].Score)
-	return parseIP(ipStr)
-}
-
-// fromHash scans all fields and finds the minimum value.
-func (lp *LatencyPlugin) fromHash(ctx context.Context, key string) (net.IP, error) {
-	fields, err := lp.rdb.HGetAll(ctx, key).Result()
-	if err != nil {
-		return nil, fmt.Errorf("HGETALL %s: %w", key, err)
-	}
-	if len(fields) == 0 {
-		return nil, fmt.Errorf("hash %q is empty or does not exist", key)
-	}
-
-	var (
-		bestIP      string
-		bestLatency = -1.0
-	)
-	for ipStr, latStr := range fields {
-		var lat float64
-		if _, err := fmt.Sscanf(latStr, "%f", &lat); err != nil {
-			log.Warningf("hash %s: skipping field %s, bad value %q: %v", key, ipStr, latStr, err)
+	bestScore := results[0].Score
+	ips := make([]net.IP, 0, len(results))
+	for _, result := range results {
+		ipStr, ok := result.Member.(string)
+		if !ok {
+			log.Errorf("unexpected member type in sorted set %q", key)
 			continue
 		}
-		if bestLatency < 0 || lat < bestLatency {
-			bestLatency = lat
-			bestIP = ipStr
+
+		if result.Score-bestScore > lp.maxLatencyDiff { // This score is too high off to be added to the latency set.
+			log.Debugf("sorted_set dropping: key=%s best_ip=%s latency=%.2fms", key, ipStr, result.Score)
+			continue
 		}
-	}
+		log.Debugf("sorted_set adding: key=%s best_ip=%s latency=%.2fms", key, ipStr, result.Score)
+		ip, err := parseIP(ipStr)
+		if err != nil {
+			log.Errorf("unexpected ip in sorted set %s", ipStr)
+			continue
+		}
+		ips = append(ips, ip)
 
-	if bestIP == "" {
-		return nil, fmt.Errorf("hash %q had no parseable latency values", key)
 	}
-
-	log.Debugf("hash: key=%s best_ip=%s latency=%.2fms", key, bestIP, bestLatency)
-	return parseIP(bestIP)
+	return ips, nil
 }
 
 // buildResponse constructs a DNS reply containing the resolved IP.
-func buildResponse(r *dns.Msg, qname string, ip net.IP, ttl uint32, qtype uint16) *dns.Msg {
+func buildResponse(r *dns.Msg, qname string, ips []net.IP, ttl uint32, qtype uint16) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetReply(r)
 	m.Authoritative = true
@@ -181,20 +149,22 @@ func buildResponse(r *dns.Msg, qname string, ip net.IP, ttl uint32, qtype uint16
 
 	hdr := dns.RR_Header{Name: qname, Ttl: ttl, Class: dns.ClassINET}
 
-	v4 := ip.To4()
+	for _, ip := range ips {
+		v4 := ip.To4()
 
-	switch {
-	case qtype == dns.TypeA && v4 != nil:
-		hdr.Rrtype = dns.TypeA
-		m.Answer = append(m.Answer, &dns.A{Hdr: hdr, A: v4})
+		switch {
+		case qtype == dns.TypeA && v4 != nil:
+			hdr.Rrtype = dns.TypeA
+			m.Answer = append(m.Answer, &dns.A{Hdr: hdr, A: v4})
 
-	case qtype == dns.TypeAAAA && v4 == nil:
-		hdr.Rrtype = dns.TypeAAAA
-		m.Answer = append(m.Answer, &dns.AAAA{Hdr: hdr, AAAA: ip})
+		case qtype == dns.TypeAAAA && v4 == nil:
+			hdr.Rrtype = dns.TypeAAAA
+			m.Answer = append(m.Answer, &dns.AAAA{Hdr: hdr, AAAA: ip})
 
-	default:
-		// qtype/IP family mismatch → return NOERROR with empty answer.
-		m.Answer = nil
+		default:
+			// qtype/IP family mismatch → return NOERROR with empty answer.
+			m.Answer = nil
+		}
 	}
 
 	return m

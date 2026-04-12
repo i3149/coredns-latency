@@ -23,17 +23,18 @@ func init() {
 // Corefile syntax
 // ---------------
 //
-//	latency {
-//	    redis_addr     localhost:6379   # default: localhost:6379
-//	    redis_password ""               # default: no password
-//	    redis_db       0                # default: 0
-//	    redis_timeout  500ms            # dial/read/write timeout (default: 500ms)
-//	    key_prefix     latency:         # Redis key prefix (default: "latency:")
-//	    key_format     sorted_set       # sorted_set | hash  (default: sorted_set)
-//	    ttl            5                # DNS record TTL in seconds (default: 5)
-//	    fallback                        # pass to next plugin when no data found
-//	    zones          example.com.     # limit to these zones (default: all)
-//	}
+//		latency {
+//		    redis_addr       localhost:6379   # default: localhost:6379
+//		    redis_password   ""               # default: no password
+//		    redis_db         0                # default: 0
+//		    redis_timeout    500ms            # dial/read/write timeout (default: 500ms)
+//		    key_prefix       latency:         # Redis key prefix (default: "latency:")
+//	            max_ips          1                # Return at most this many possible ips.
+//	            max_latency_diff 100              # All ips within this ms of the best score returned.
+//		    ttl              5                # DNS record TTL in seconds (default: 5)
+//		    fallback                          # pass to next plugin when no data found
+//		    zones            example.com.     # limit to these zones (default: all)
+//		}
 func setup(c *caddy.Controller) error {
 	lp, err := parse(c)
 	if err != nil {
@@ -67,9 +68,9 @@ func setup(c *caddy.Controller) error {
 func parse(c *caddy.Controller) (*LatencyPlugin, error) {
 	lp := &LatencyPlugin{
 		keyPrefix: "latency:",
-		format:    sortedSet,
 		ttl:       5,
 		fallback:  false,
+		maxIPS:    0,
 	}
 
 	// Redis client options with sensible defaults.
@@ -128,19 +129,24 @@ func parse(c *caddy.Controller) (*LatencyPlugin, error) {
 				}
 				lp.keyPrefix = c.Val()
 
-			case "key_format":
+			case "max_ips":
 				if !c.NextArg() {
 					return nil, c.ArgErr()
 				}
-				switch c.Val() {
-				case "sorted_set":
-					lp.format = sortedSet
-				case "hash":
-					lp.format = hashMap
-				default:
-					return nil, fmt.Errorf("key_format: unknown value %q (want sorted_set or hash)", c.Val())
+				maxIPS, err := strconv.ParseInt(c.Val(), 0, 64)
+				if err != nil {
+					return nil, fmt.Errorf("max_ips: %w", err)
 				}
-
+				lp.maxIPS = maxIPS - 1 // Because zrange is inclusive, we want 1 less than max.
+			case "max_latency_diff":
+				if !c.NextArg() {
+					return nil, c.ArgErr()
+				}
+				maxLatencyDiff, err := strconv.ParseFloat(c.Val(), 64)
+				if err != nil {
+					return nil, fmt.Errorf("max_latency_diff: %w", err)
+				}
+				lp.maxLatencyDiff = maxLatencyDiff
 			case "ttl":
 				if !c.NextArg() {
 					return nil, c.ArgErr()

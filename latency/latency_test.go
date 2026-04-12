@@ -13,17 +13,18 @@ import (
 )
 
 // newTestPlugin spins up a miniredis server and returns a configured plugin.
-func newTestPlugin(t *testing.T, format keyFormat) (*LatencyPlugin, *miniredis.Miniredis) {
+func newTestPlugin(t *testing.T, maxIPs int64, maxDiff float64) (*LatencyPlugin, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	return &LatencyPlugin{
-		rdb:       rdb,
-		keyPrefix: "latency:",
-		format:    format,
-		ttl:       5,
-		fallback:  false,
-		Next:      test.ErrorHandler(),
+		rdb:            rdb,
+		keyPrefix:      "latency:",
+		ttl:            5,
+		maxIPS:         maxIPs - 1,
+		maxLatencyDiff: maxDiff,
+		fallback:       false,
+		Next:           test.ErrorHandler(),
 	}, mr
 }
 
@@ -32,63 +33,54 @@ func newTestPlugin(t *testing.T, format keyFormat) (*LatencyPlugin, *miniredis.M
 // ---------------------------------------------------------------------------
 
 func TestSortedSet_ReturnsLowestLatency(t *testing.T) {
-	lp, mr := newTestPlugin(t, sortedSet)
+	lp, mr := newTestPlugin(t, 1, 10)
 
 	// Populate: 10.0.0.3 has lowest latency (5 ms).
-	mr.ZAdd("latency:api.example.com.", 50, "10.0.0.1")
-	mr.ZAdd("latency:api.example.com.", 30, "10.0.0.2")
-	mr.ZAdd("latency:api.example.com.", 5, "10.0.0.3")
+	mr.ZAdd("latency:api.example.com.:A", 50, "10.0.0.1")
+	mr.ZAdd("latency:api.example.com.:A", 30, "10.0.0.2")
+	mr.ZAdd("latency:api.example.com.:A", 5, "10.0.0.3")
 
-	ip, err := lp.lowestLatencyIP(context.Background(), "api.example.com.")
+	ips, err := lp.lowestLatencyIPS(context.Background(), "api.example.com.", dns.TypeA)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !ip.Equal(net.ParseIP("10.0.0.3")) {
-		t.Errorf("expected 10.0.0.3, got %s", ip)
+	if len(ips) != 1 {
+		t.Fatalf("unexpected ip set length: %d", len(ips))
+	}
+	if !ips[0].Equal(net.ParseIP("10.0.0.3")) {
+		t.Errorf("expected 10.0.0.3, got %s", ips[0])
+	}
+}
+
+func TestSortedSet_ReturnsLowestLatencyBound(t *testing.T) {
+	lp, mr := newTestPlugin(t, 5, 10)
+
+	// Populate: 10.0.0.3 has lowest latency (5 ms).
+	mr.ZAdd("latency:api.example.com.:A", 50, "10.0.0.1")
+	mr.ZAdd("latency:api.example.com.:A", 7, "10.0.0.2")
+	mr.ZAdd("latency:api.example.com.:A", 5, "10.0.0.3")
+
+	ips, err := lp.lowestLatencyIPS(context.Background(), "api.example.com.", dns.TypeA)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(ips) != 2 {
+		t.Fatalf("unexpected ip set length: %d", len(ips))
+	}
+	if !ips[0].Equal(net.ParseIP("10.0.0.3")) {
+		t.Errorf("expected 10.0.0.3, got %s", ips[0])
+	}
+	if !ips[1].Equal(net.ParseIP("10.0.0.2")) {
+		t.Errorf("expected 10.0.0.2, got %s", ips[0])
 	}
 }
 
 func TestSortedSet_EmptyKey(t *testing.T) {
-	lp, _ := newTestPlugin(t, sortedSet)
+	lp, _ := newTestPlugin(t, 1, 10)
 
-	_, err := lp.lowestLatencyIP(context.Background(), "missing.example.com.")
+	_, err := lp.lowestLatencyIPS(context.Background(), "missing.example.com.", dns.TypeA)
 	if err == nil {
 		t.Fatal("expected error for missing key, got nil")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Hash tests
-// ---------------------------------------------------------------------------
-
-func TestHash_ReturnsLowestLatency(t *testing.T) {
-	lp, mr := newTestPlugin(t, hashMap)
-
-	mr.HSet("latency:api.example.com.", "10.0.0.1", "120")
-	mr.HSet("latency:api.example.com.", "10.0.0.2", "8")
-	mr.HSet("latency:api.example.com.", "10.0.0.3", "45")
-
-	ip, err := lp.lowestLatencyIP(context.Background(), "api.example.com.")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ip.Equal(net.ParseIP("10.0.0.2")) {
-		t.Errorf("expected 10.0.0.2, got %s", ip)
-	}
-}
-
-func TestHash_SkipsBadValues(t *testing.T) {
-	lp, mr := newTestPlugin(t, hashMap)
-
-	mr.HSet("latency:api.example.com.", "10.0.0.1", "not-a-number")
-	mr.HSet("latency:api.example.com.", "10.0.0.2", "25")
-
-	ip, err := lp.lowestLatencyIP(context.Background(), "api.example.com.")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ip.Equal(net.ParseIP("10.0.0.2")) {
-		t.Errorf("expected 10.0.0.2, got %s", ip)
 	}
 }
 
@@ -97,8 +89,9 @@ func TestHash_SkipsBadValues(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestServeDNS_ARecord(t *testing.T) {
-	lp, mr := newTestPlugin(t, sortedSet)
-	mr.ZAdd("latency:api.example.com.", 10, "1.2.3.4")
+	lp, mr := newTestPlugin(t, 2, 10)
+	mr.ZAdd("latency:api.example.com.:A", 10, "1.2.3.4")
+	mr.ZAdd("latency:api.example.com.:A", 15, "1.2.3.5")
 
 	req := new(dns.Msg)
 	req.SetQuestion("api.example.com.", dns.TypeA)
@@ -113,8 +106,8 @@ func TestServeDNS_ARecord(t *testing.T) {
 	}
 
 	resp := rec.Msg
-	if len(resp.Answer) != 1 {
-		t.Fatalf("expected 1 answer, got %d", len(resp.Answer))
+	if len(resp.Answer) != 2 {
+		t.Fatalf("expected 2 answer, got %d", len(resp.Answer))
 	}
 	a, ok := resp.Answer[0].(*dns.A)
 	if !ok {
@@ -123,11 +116,18 @@ func TestServeDNS_ARecord(t *testing.T) {
 	if !a.A.Equal(net.ParseIP("1.2.3.4")) {
 		t.Errorf("expected 1.2.3.4, got %s", a.A)
 	}
+	a, ok = resp.Answer[1].(*dns.A)
+	if !ok {
+		t.Fatalf("expected A record, got %T", resp.Answer[1])
+	}
+	if !a.A.Equal(net.ParseIP("1.2.3.5")) {
+		t.Errorf("expected 1.2.3.5, got %s", a.A)
+	}
 }
 
 func TestServeDNS_AAAARecord(t *testing.T) {
-	lp, mr := newTestPlugin(t, sortedSet)
-	mr.ZAdd("latency:ipv6.example.com.", 10, "2001:db8::1")
+	lp, mr := newTestPlugin(t, 1, 10)
+	mr.ZAdd("latency:ipv6.example.com.:AAAA", 10, "2001:db8::1")
 
 	req := new(dns.Msg)
 	req.SetQuestion("ipv6.example.com.", dns.TypeAAAA)
@@ -155,7 +155,7 @@ func TestServeDNS_AAAARecord(t *testing.T) {
 }
 
 func TestServeDNS_FallbackOnMissingData(t *testing.T) {
-	lp, _ := newTestPlugin(t, sortedSet)
+	lp, _ := newTestPlugin(t, 1, 10)
 	lp.fallback = true
 	// Next handler returns NXDOMAIN.
 	lp.Next = test.ErrorHandler()
@@ -172,7 +172,7 @@ func TestServeDNS_FallbackOnMissingData(t *testing.T) {
 }
 
 func TestServeDNS_NonAQuery_PassThrough(t *testing.T) {
-	lp, _ := newTestPlugin(t, sortedSet)
+	lp, _ := newTestPlugin(t, 1, 10)
 
 	req := new(dns.Msg)
 	req.SetQuestion("api.example.com.", dns.TypeMX)
