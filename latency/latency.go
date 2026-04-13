@@ -153,7 +153,7 @@ func (lp *LatencyPlugin) fromHash(ctx context.Context, key string) ([]net.IP, er
 		}
 	}
 
-	log.Debugf("hash: key=%s best_ips=%v", key, results)
+	log.Debugf("hash: key=%s fullset=%v best_ips=%v", key, ips, results)
 	return results, nil
 }
 
