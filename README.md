@@ -1,6 +1,6 @@
 # coredns-latency
 
-A [CoreDNS](https://coredns.io) plugin that **returns the IP address with the
+A [CoreDNS](https://coredns.io) plugin that **returns the IP address(s) with the
 lowest measured latency** from a candidate set stored in Redis.
 
 ```
@@ -17,12 +17,8 @@ DNS client  ──▶  CoreDNS (latency plugin)  ──▶  Redis
 
 1. A DNS query arrives for `api.example.com. A`.
 2. The plugin looks up the Redis key `latency:api.example.com.`.
-3. It picks the member with the **smallest score / value** (= lowest latency in ms).
+3. It picks the members with the lowest scores within a defined equivalency set.
 4. It synthesises an `A` (or `AAAA`) record and returns it immediately.
-
-Latency values in Redis are typically written by a **sidecar prober** that
-periodically measures round-trip time to each candidate IP (e.g. using ICMP or
-TCP SYN probes) and updates the scores.
 
 ---
 
@@ -37,32 +33,17 @@ Score : latency in milliseconds   (float64)
 Member: IP address string
 
 # Write
-ZADD latency:api.example.com. 12.5 "10.0.0.1"
-ZADD latency:api.example.com.  8.3 "10.0.0.2"
-ZADD latency:api.example.com. 35.0 "10.0.0.3"
+ZADD latency:api.example.com.:A 12.5 "10.0.0.1"
+ZADD latency:api.example.com.:A  8.3 "10.0.0.2"
+ZADD latency:api.example.com.:A 35.0 "10.0.0.3"
 
 # Read (done internally by the plugin)
-ZRANGE latency:api.example.com. 0 0 WITHSCORES
+ZRANGE latency:api.example.com.:A 0 0 WITHSCORES
 # → "10.0.0.2"  8.3
 ```
 
 **Why sorted sets?** O(log N) writes, O(1) minimum retrieval — perfect for
 frequently updated latency scores.
-
-### `hash` — alternative
-
-```
-Key   : "latency:<fqdn>"
-Type  : Hash
-Field : IP address string
-Value : latency in milliseconds   (string-encoded float)
-
-HSET latency:api.example.com. 10.0.0.1 12.5
-HSET latency:api.example.com. 10.0.0.2  8.3
-```
-
-The plugin scans all fields with `HGETALL` and finds the minimum. Use this if
-your prober already writes hashes.
 
 ---
 
@@ -70,14 +51,15 @@ your prober already writes hashes.
 
 ```corefile
 latency [ZONES...] {
-    redis_addr     <host:port>     # default: localhost:6379
-    redis_password <password>      # default: (none)
-    redis_db       <int>           # default: 0
-    redis_timeout  <duration>      # default: 500ms
-    key_prefix     <string>        # default: "latency:"
-    key_format     sorted_set|hash # default: sorted_set
-    ttl            <seconds>       # default: 5
-    fallback                       # pass to next plugin if no Redis data
+    redis_addr       <host:port>     # default: localhost:6379
+    redis_password   <password>      # default: (none)
+    redis_db         <int>           # default: 0
+    redis_timeout    <duration>      # default: 500ms
+    key_prefix       <string>        # default: "latency:"
+    max_ips          1               # Return at most this many possible ips.
+    max_latency_diff 100             # All ips within this ms of the best score returned.
+    ttl              <seconds>       # default: 5
+    fallback                         # pass to next plugin if no Redis data
 }
 ```
 
@@ -88,7 +70,8 @@ latency [ZONES...] {
 | `redis_db` | `0` | Redis logical database |
 | `redis_timeout` | `500ms` | Dial / read / write timeout |
 | `key_prefix` | `latency:` | Prepended to the FQDN to form the Redis key |
-| `key_format` | `sorted_set` | Redis data structure (`sorted_set` or `hash`) |
+| `max_ips` | `1` | Return at most this many ips |
+| `max_latency_diff` | `100` | All ips returned must be at least this close to the best score |
 | `ttl` | `5` | DNS record TTL in seconds |
 | `fallback` | _(flag)_ | When set, pass through to `next` plugin if no data |
 
@@ -110,7 +93,7 @@ cd coredns
 Add one line to `plugin.cfg` (order matters — place before `forward`):
 
 ```
-latency:github.com/yourorg/coredns-latency
+latency:github.com/i3149/coredns-latency
 ```
 
 ### 3. Update `go.mod`
@@ -125,52 +108,6 @@ go mod tidy
 ```bash
 make
 ./coredns -conf Corefile
-```
-
----
-
-## Sidecar prober example (Python)
-
-```python
-"""
-Minimal latency prober — measures TCP connect time and updates Redis.
-Run this on a schedule (e.g. every 10 s via cron or a loop).
-"""
-import time, socket, redis
-
-HOSTS = {
-    "api.example.com.": ["10.0.0.1", "10.0.0.2", "10.0.0.3"],
-}
-PORT   = 443     # probe port
-TRIALS = 3       # average over N trials
-
-r = redis.Redis(host="localhost", decode_responses=True)
-
-def probe(ip: str, port: int) -> float:
-    """Return average TCP connect latency in ms, or 9999 on failure."""
-    times = []
-    for _ in range(TRIALS):
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1)
-            t0 = time.perf_counter()
-            s.connect((ip, port))
-            times.append((time.perf_counter() - t0) * 1000)
-            s.close()
-        except OSError:
-            times.append(9999)
-    return sum(times) / len(times)
-
-while True:
-    pipe = r.pipeline()
-    for fqdn, ips in HOSTS.items():
-        key = f"latency:{fqdn}"
-        for ip in ips:
-            lat = probe(ip, PORT)
-            pipe.zadd(key, {ip: lat})
-            print(f"{fqdn} {ip} {lat:.1f}ms")
-    pipe.execute()
-    time.sleep(10)
 ```
 
 ---
@@ -211,15 +148,15 @@ instance required.
 │                    │                                │
 │            lowestLatencyIP()                        │
 │                    │                                │
-│         ┌──────────┴──────────┐                    │
-│         │ sorted_set          │ hash                │
-│         │ ZRANGE key 0 0      │ HGETALL key         │
-│         │ (O(log N) best IP)  │ (O(N) linear scan)  │
-│         └──────────┬──────────┘                    │
+│         ┌──────────┴──────────┐                     │
+│         │ sorted_set          │                     │
+│         │ ZRANGE key 0 0      │                     │
+│         │ (O(log N) best IP)  │                     │
+│         └──────────┬──────────┘                     │
 │                    │                                │
 │           build A/AAAA response                     │
 │                    │                                │
-│  DNS response ◀────┘                               │
+│  DNS response ◀────┘                                │
 └─────────────────────────────────────────────────────┘
              │
              ▼ (on cache miss / fallback)
