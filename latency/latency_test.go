@@ -29,16 +29,16 @@ func newTestPlugin(t *testing.T, maxIPs int64, maxDiff float64) (*LatencyPlugin,
 }
 
 // ---------------------------------------------------------------------------
-// Sorted-set tests
+// Hash tests
 // ---------------------------------------------------------------------------
 
 func TestSortedSet_ReturnsLowestLatency(t *testing.T) {
 	lp, mr := newTestPlugin(t, 1, 10)
 
 	// Populate: 10.0.0.3 has lowest latency (5 ms).
-	mr.ZAdd("latency:api.example.com.:A", 50, "10.0.0.1")
-	mr.ZAdd("latency:api.example.com.:A", 30, "10.0.0.2")
-	mr.ZAdd("latency:api.example.com.:A", 5, "10.0.0.3")
+	mr.HSet("latency:api.example.com.:A", "10.0.0.1", "50")
+	mr.HSet("latency:api.example.com.:A", "10.0.0.2", "30")
+	mr.HSet("latency:api.example.com.:A", "10.0.0.3", "5")
 
 	ips, err := lp.lowestLatencyIPS(context.Background(), "api.example.com.", dns.TypeA)
 	if err != nil {
@@ -53,12 +53,12 @@ func TestSortedSet_ReturnsLowestLatency(t *testing.T) {
 }
 
 func TestSortedSet_ReturnsLowestLatencyBound(t *testing.T) {
-	lp, mr := newTestPlugin(t, 5, 10)
+	lp, mr := newTestPlugin(t, 5, 2)
 
 	// Populate: 10.0.0.3 has lowest latency (5 ms).
-	mr.ZAdd("latency:api.example.com.:A", 50, "10.0.0.1")
-	mr.ZAdd("latency:api.example.com.:A", 7, "10.0.0.2")
-	mr.ZAdd("latency:api.example.com.:A", 5, "10.0.0.3")
+	mr.HSet("latency:api.example.com.:A", "10.0.0.1", "50")
+	mr.HSet("latency:api.example.com.:A", "10.0.0.2", "7")
+	mr.HSet("latency:api.example.com.:A", "10.0.0.3", "5.50")
 
 	ips, err := lp.lowestLatencyIPS(context.Background(), "api.example.com.", dns.TypeA)
 	if err != nil {
@@ -90,8 +90,8 @@ func TestSortedSet_EmptyKey(t *testing.T) {
 
 func TestServeDNS_ARecord(t *testing.T) {
 	lp, mr := newTestPlugin(t, 2, 10)
-	mr.ZAdd("latency:api.example.com.:A", 10, "1.2.3.4")
-	mr.ZAdd("latency:api.example.com.:A", 15, "1.2.3.5")
+	mr.HSet("latency:api.example.com.:A", "1.2.3.4", "10")
+	mr.HSet("latency:api.example.com.:A", "1.2.3.5", "15")
 
 	req := new(dns.Msg)
 	req.SetQuestion("api.example.com.", dns.TypeA)
@@ -127,7 +127,7 @@ func TestServeDNS_ARecord(t *testing.T) {
 
 func TestServeDNS_AAAARecord(t *testing.T) {
 	lp, mr := newTestPlugin(t, 1, 10)
-	mr.ZAdd("latency:ipv6.example.com.:AAAA", 10, "2001:db8::1")
+	mr.HSet("latency:ipv6.example.com.:AAAA", "2001:db8::1", "10")
 
 	req := new(dns.Msg)
 	req.SetQuestion("ipv6.example.com.", dns.TypeAAAA)

@@ -22,28 +22,22 @@ DNS client  ──▶  CoreDNS (latency plugin)  ──▶  Redis
 
 ---
 
-## Redis data models
+## Redis data model
 
-### `sorted_set` (default) — recommended
+### `hash` -- used because it lets us set TTLs
 
 ```
-Key   : "latency:<fqdn>"          e.g.  latency:api.example.com.
-Type  : Sorted Set
-Score : latency in milliseconds   (float64)
-Member: IP address string
+Key   : "latency:<fqdn>:<ip_type>"
+Type  : Hash
+Field : IP address string
+Value : latency in milliseconds   (string-encoded float)
 
-# Write
-ZADD latency:api.example.com.:A 12.5 "10.0.0.1"
-ZADD latency:api.example.com.:A  8.3 "10.0.0.2"
-ZADD latency:api.example.com.:A 35.0 "10.0.0.3"
-
-# Read (done internally by the plugin)
-ZRANGE latency:api.example.com.:A 0 0 WITHSCORES
-# → "10.0.0.2"  8.3
+HSET latency:api.example.com.:A 10.0.0.1 12.5
+HSET latency:api.example.com.:A 10.0.0.2  8.3
 ```
 
-**Why sorted sets?** O(log N) writes, O(1) minimum retrieval — perfect for
-frequently updated latency scores.
+The plugin scans all fields with `HGETALL` and finds the minimum. Use this if
+your prober already writes hashes.
 
 ---
 
@@ -149,7 +143,7 @@ instance required.
 │            lowestLatencyIP()                        │
 │                    │                                │
 │         ┌──────────┴──────────┐                     │
-│         │ sorted_set          │                     │
+│         │ hash                │                     │
 │         │ ZRANGE key 0 0      │                     │
 │         │ (O(log N) best IP)  │                     │
 │         └──────────┬──────────┘                     │

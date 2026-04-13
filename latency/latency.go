@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
+	"strconv"
 	"time"
 
 	"github.com/coredns/coredns/plugin"
@@ -16,20 +18,15 @@ import (
 
 var log = clog.NewWithPlugin("latency")
 
-/**
-TODO
-*/
-
-// RedisKeyFormat defines how latency keys are stored in Redis.
 //
-//  1. sorted_set
-//     Key  : "latency:<fqdn>:<dns_type>"          e.g. "latency:api.example.com.:A"
-//     Type : Redis Sorted Set
-//     Score: latency in milliseconds (float64)
-//     Member: IP address string        e.g. "10.0.0.1"
+//  2. hash
+//     Key  : "latency:<fqdn>"
+//     Type : Redis Hash
+//     Field: IP address string
+//     Value: latency in milliseconds (string-encoded float) e.g. "12.5"
 //
-//     ZADD latency:api.example.com.:A  12.5 10.0.0.1
-//     ZADD latency:api.example.com.:A  8.3 10.0.0.2
+//     HSET latency:api.example.com.:A 10.0.0.1 12.5
+//     HSET latency:api.example.com.:A 10.0.0.2  8.3
 
 // LatencyPlugin is the main plugin struct.
 type LatencyPlugin struct {
@@ -102,42 +99,62 @@ func (lp *LatencyPlugin) lowestLatencyIPS(ctx context.Context, fqdn string, qtyp
 		key = key + ":AAAA"
 	}
 
-	return lp.fromSortedSet(ctx, key)
+	return lp.fromHash(ctx, key)
 }
 
-// fromSortedSet uses ZRANGE key 0 0 (lowest score first).
-func (lp *LatencyPlugin) fromSortedSet(ctx context.Context, key string) ([]net.IP, error) {
-	results, err := lp.rdb.ZRangeWithScores(ctx, key, 0, lp.maxIPS).Result()
+// Holder here for a way to sort hash values.
+type ipset struct {
+	ip net.IP
+	s  float64
+}
+type byScore []ipset
+
+func (a byScore) Len() int           { return len(a) }
+func (a byScore) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a byScore) Less(i, j int) bool { return a[i].s < a[j].s }
+
+// fromHash scans all fields and finds the minimum value.
+func (lp *LatencyPlugin) fromHash(ctx context.Context, key string) ([]net.IP, error) {
+	fields, err := lp.rdb.HGetAll(ctx, key).Result()
 	if err != nil {
-		return nil, fmt.Errorf("ZRANGE %s: %w", key, err)
+		return nil, fmt.Errorf("HGETALL %s: %w", key, err)
 	}
-	if len(results) == 0 {
-		return nil, fmt.Errorf("sorted set %q is empty or does not exist", key)
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("hash %q is empty or does not exist", key)
 	}
 
-	bestScore := results[0].Score
-	ips := make([]net.IP, 0, len(results))
-	for _, result := range results {
-		ipStr, ok := result.Member.(string)
-		if !ok {
-			log.Errorf("unexpected member type in sorted set %q", key)
+	ips := make([]ipset, 0, len(fields))
+	for ipStr, latStr := range fields {
+		if lat, err := strconv.ParseFloat(latStr, 64); err != nil {
+			log.Warningf("hash %s: skipping field %s, bad value %q: %v", key, ipStr, latStr, err)
 			continue
+		} else {
+			ip, err := parseIP(ipStr)
+			if err != nil || lat <= 0 {
+				continue
+			}
+			ips = append(ips, ipset{ip: ip, s: lat})
 		}
-
-		if result.Score-bestScore > lp.maxLatencyDiff { // This score is too high off to be added to the latency set.
-			log.Debugf("sorted_set dropping: key=%s best_ip=%s latency=%.2fms", key, ipStr, result.Score)
-			continue
-		}
-		log.Debugf("sorted_set adding: key=%s best_ip=%s latency=%.2fms", key, ipStr, result.Score)
-		ip, err := parseIP(ipStr)
-		if err != nil {
-			log.Errorf("unexpected ip in sorted set %s", ipStr)
-			continue
-		}
-		ips = append(ips, ip)
-
 	}
-	return ips, nil
+
+	// Sort here to make picking out top x easier.
+	sort.Sort(byScore(ips))
+
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("hash %q had no parseable latency values", key)
+	}
+
+	// Now, itterate one more time getting all of the ones within lp.maxLatencyDiff of the best.
+	results := make([]net.IP, 0, lp.maxIPS)
+	bestLat := ips[0].s
+	for _, ip := range ips {
+		if ip.s-bestLat < lp.maxLatencyDiff {
+			results = append(results, ip.ip)
+		}
+	}
+
+	log.Debugf("hash: key=%s best_ips=%v", key, results)
+	return results, nil
 }
 
 // buildResponse constructs a DNS reply containing the resolved IP.

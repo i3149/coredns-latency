@@ -2,13 +2,13 @@
     log
     debug
     latency {
-        redis_addr     redis:6379
-        key_format     sorted_set
-        redis_password pass
-        redis_db       0
-        key_prefix     latency_
-        key_format     sorted_set
-        ttl            5
+        redis_addr       redis:6379
+        redis_password   pass
+        redis_db         0
+        key_prefix       latency_
+        ttl              5
+        max_ips          2
+        max_latency_diff 200
         fallback          # pass through if no Redis data
     }
     forward . 1.1.1.1    # forward everything else upstream
