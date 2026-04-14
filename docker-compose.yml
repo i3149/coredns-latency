@@ -12,7 +12,7 @@ services:
     depends_on:
       - redis
     environment:
-        - KENTIK_API_TOKEN=f6afa078d50198a9831cf0ed4b88d9df
+        - KENTIK_API_TOKEN=MY_KENTIK_TOKEN
     command:
       - --listen=0.0.0.0:9995
       - --metalisten=0.0.0.0:9996
@@ -20,8 +20,8 @@ services:
       - --redis.addr=redis:6379
       - --redis.db=0
       - --format=redis
-      - --log_level=debug
-      - --kentik_email=kproxy-agent+15065@kentik.com
+      - --log_level=info
+      - --kentik_email=MY_KENTIK_EMAIL
       - --redis.key_prefix=latency_
     ports:
       - 4040:9995
@@ -34,7 +34,6 @@ services:
       - "5353:5353/tcp"
     volumes:
       - ./conf:/etc/coredns
-      - ./coredns:/coredns
     restart: unless-stopped
     depends_on:
       - redis
